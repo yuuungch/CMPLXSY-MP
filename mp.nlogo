@@ -19,6 +19,8 @@ globals [
   traffic-light-timer
   simulation-data
   global-traffic-phase
+  sum-travel-time-completed
+  throughput
 ]
 
 ;; ==========================================
@@ -64,6 +66,7 @@ patches-own [
   is-intersection
   road-direction  ; "horizontal", "vertical", or "both"
   car-here
+  sig-timer sig-threshold sig-phase  ; per-intersection signal controller
 ]
 
 ;; ==========================================
@@ -83,6 +86,8 @@ to setup
   set traffic-light-timer 0
   set simulation-data []
   set global-traffic-phase "vertical" ;; Default to vertical phase
+  set sum-travel-time-completed 0
+  set throughput 0
 
   ;; Setup the environment
   setup-road-grid
@@ -151,11 +156,18 @@ to setup-traffic-lights
   ]
 
   ask intersection-centers [
+    ;; initialize per-intersection controller with randomized threshold within [min,max]
+    let minC max list 1 floor minimum-traffic-light-cycle-time
+    let maxC max list minC floor maximum-traffic-light-cycle-time
+    set sig-phase "vertical"
+    set sig-timer 0
+    set sig-threshold minC + random (maxC - minC + 1)
+
     ;; top-left -> south (vertical)
     sprout-traffic-lights 1 [
       set state "green"
       set light-timer 0
-      set cycle-time traffic-light-cycle-time
+      set cycle-time maximum-traffic-light-cycle-time
       set direction "south"
       set color green
       set shape "circle"
@@ -166,8 +178,8 @@ to setup-traffic-lights
     ;; top-right -> west (horizontal)
     sprout-traffic-lights 1 [
       set state "red"
-      set light-timer traffic-light-cycle-time
-      set cycle-time traffic-light-cycle-time
+      set light-timer maximum-traffic-light-cycle-time
+      set cycle-time maximum-traffic-light-cycle-time
       set direction "west"
       set color red
       set shape "circle"
@@ -178,8 +190,8 @@ to setup-traffic-lights
     ;; bottom-left -> east (horizontal)
     sprout-traffic-lights 1 [
       set state "red"
-      set light-timer traffic-light-cycle-time
-      set cycle-time traffic-light-cycle-time
+      set light-timer maximum-traffic-light-cycle-time
+      set cycle-time maximum-traffic-light-cycle-time
       set direction "east"
       set color red
       set shape "circle"
@@ -191,7 +203,7 @@ to setup-traffic-lights
     sprout-traffic-lights 1 [
       set state "green"
       set light-timer 0
-      set cycle-time traffic-light-cycle-time
+      set cycle-time maximum-traffic-light-cycle-time
       set direction "north"
       set color green
       set shape "circle"
@@ -380,39 +392,34 @@ end
 ;; ==========================================
 
 to update-traffic-lights
-  ;; Use a global phase system to coordinate all traffic lights
-  set traffic-light-timer traffic-light-timer + 1
+  ;; Each intersection center patch controls its four lights with its own randomized cycle
+  ask patches with [is-intersection and pxcor mod 5 = 0 and pycor mod 5 = 0] [
+    set sig-timer sig-timer + 1
 
-  if traffic-light-timer >= traffic-light-cycle-time [
-    ;; Toggle the global phase
-    ifelse global-traffic-phase = "vertical" [
-      set global-traffic-phase "horizontal"
-    ] [
-      set global-traffic-phase "vertical"
+    let minC max list 1 floor minimum-traffic-light-cycle-time
+    let maxC max list minC floor maximum-traffic-light-cycle-time
+
+    if sig-timer >= sig-threshold [
+      ifelse sig-phase = "vertical" [ set sig-phase "horizontal" ] [ set sig-phase "vertical" ]
+      set sig-timer 0
+      set sig-threshold minC + random (maxC - minC + 1)
     ]
-    set traffic-light-timer 0
-  ]
 
-  ;; Update all traffic lights based on the global phase
-  ask traffic-lights [
-    ifelse (direction = "north" or direction = "south") [
-      ;; Vertical lights
-      ifelse global-traffic-phase = "vertical" [
-        set state "green"
-        set color green
-      ] [
-        set state "red"
-        set color red
-      ]
+    let v-lights traffic-lights with [
+      abs (xcor - [pxcor] of myself) = 1 and abs (ycor - [pycor] of myself) = 1 and
+      (direction = "north" or direction = "south")
+    ]
+    let h-lights traffic-lights with [
+      abs (xcor - [pxcor] of myself) = 1 and abs (ycor - [pycor] of myself) = 1 and
+      (direction = "east" or direction = "west")
+    ]
+
+    ifelse sig-phase = "vertical" [
+      ask v-lights [ set state "green" set color green ]
+      ask h-lights [ set state "red"   set color red ]
     ] [
-      ;; Horizontal lights
-      ifelse global-traffic-phase = "horizontal" [
-        set state "green"
-        set color green
-      ] [
-        set state "red"
-        set color red
-      ]
+      ask v-lights [ set state "red"   set color red ]
+      ask h-lights [ set state "green" set color green ]
     ]
   ]
 end
@@ -425,6 +432,7 @@ to make-decision
   ;; Check if car has reached its specific destination edge (with some tolerance)
   if (abs (pxcor - destination-x) <= 1 and abs (pycor - destination-y) <= 1) [
     set cars-completed cars-completed + 1
+    set sum-travel-time-completed sum-travel-time-completed + travel-time
     ask patch-here [ set car-here false ]
     die
     stop
@@ -610,13 +618,13 @@ to collect-initial-data
 end
 
 to collect-data
-  ;; Calculate average travel time for completed cars
-  if cars-completed > 0 and count cars > 0 [
-    set average-travel-time (sum [travel-time] of cars) / count cars
+  ;; Throughput = completed cars per tick (time-step)
+  if time-step > 0 [
+    set throughput cars-completed / time-step
   ]
 
-  ;; Store data point
-  set simulation-data lput (list time-step congestion-level average-travel-time) simulation-data
+  ;; Store data point (time, congestion, throughput)
+  set simulation-data lput (list time-step congestion-level throughput) simulation-data
 end
 
 to collect-data-now
@@ -624,7 +632,7 @@ to collect-data-now
   collect-data
   print (word "Data collected at time step: " time-step)
   print (word "Congestion level: " congestion-level)
-  print (word "Average travel time: " average-travel-time)
+  print (word "Throughput: " throughput)
 end
 
 ;; ==========================================
@@ -695,13 +703,13 @@ to-report get-opposite-lane-position [current-heading]
 end
 @#$#@#$#@
 GRAPHICS-WINDOW
-652
+619
 10
-1363
-722
+1303
+695
 -1
 -1
-11.525
+11.082
 1
 10
 1
@@ -756,59 +764,44 @@ NIL
 1
 
 SLIDER
-33
-104
-205
-137
-initial-car-density
-initial-car-density
 0
-30
-10.0
-1
+82
+172
+115
+initial-car-density
+initial-car-density
+5
+15
+15.0
+5
 1
 NIL
 HORIZONTAL
 
 SLIDER
-33
-148
-205
-181
-traffic-light-cycle-time
-traffic-light-cycle-time
-1
+0
+176
+219
+209
+maximum-traffic-light-cycle-time
+maximum-traffic-light-cycle-time
+5
 50
 25.0
-1
-1
-NIL
-HORIZONTAL
-
-SLIDER
-33
-198
-205
-231
-turning-probability
-turning-probability
-0
-1
-1.0
-0.01
-1
-NIL
-HORIZONTAL
-
-SLIDER
-31
-248
-203
-281
-max-car-speed
-max-car-speed
-0
 5
+1
+NIL
+HORIZONTAL
+
+SLIDER
+0
+228
+172
+261
+max-car-speed
+max-car-speed
+1
+10
 5.0
 1
 1
@@ -853,8 +846,8 @@ MONITOR
 158
 596
 203
-Average Travel Time
-average-travel-time
+Throughput
+throughput
 17
 1
 11
@@ -872,9 +865,9 @@ congestion-level
 
 PLOT
 0
-368
+497
 200
-518
+647
 Congestion over Time
 NIL
 NIL
@@ -890,10 +883,10 @@ PENS
 
 PLOT
 202
-368
+497
 402
-518
-Average Travel Time over Time
+647
+Throughput over Time
 NIL
 NIL
 0.0
@@ -904,7 +897,22 @@ true
 false
 "" ""
 PENS
-"default" 1.0 0 -16777216 true "" "plot average-travel-time"
+"default" 1.0 0 -16777216 true "" "plot throughput * 100"
+
+SLIDER
+0
+136
+221
+169
+minimum-traffic-light-cycle-time
+minimum-traffic-light-cycle-time
+5
+25
+25.0
+5
+1
+NIL
+HORIZONTAL
 
 @#$#@#$#@
 ## WHAT IS IT?
